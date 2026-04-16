@@ -1,73 +1,79 @@
+#!/usr/bin/env python3
 """
-==============================================================================
-LE FLUX — Code Python complet
-Aurélien Sureau, Mars 2026
-DOI : 10.5281/zenodo.19219721
+LE FLUX v10 — ADDENDUM 1
+========================
+The Galactic Flux Vortex Coherence Length Scales with HI Disk Radius
 
-Test quantitatif de la formule EOS β sur 163 galaxies SPARC
-Comparaison avec NFW et Burkert
-Extension aux amas de galaxies (Jeans) et au système solaire
+Reproduces all results from Addendum 1 (Sureau 2026):
+  - Correlation analysis: rc vs baryonic observables (SBdisk, SBeff, Rdisk, RHI)
+  - Partial correlations controlling for L[3.6] and Vflat
+  - Physics-guided bounded model: rc in [RHI/C_low, C_high*RHI]
+  - Grid search for optimal bounds
+  - All figures
 
-Données SPARC : https://astroweb.cwru.edu/SPARC/
-  - SPARC_Lelli2016c.mrt  (table des galaxies avec types Hubble)
-  - Fichiers *_rotmod.dat  (courbes de rotation individuelles)
+Requirements:
+    pip install numpy scipy matplotlib
 
-Usage :
-  python3 flux_complet.py
-  → Génère les graphiques et affiche les statistiques χ²r
-==============================================================================
+Data:
+    - SPARC_Lelli2016c.mrt   : from http://astroweb.cwru.edu/SPARC/
+    - *_rotmod.dat files      : from http://astroweb.cwru.edu/SPARC/ (Rotmod_LTG.zip)
+
+Usage:
+    python leflux_addendum1.py --sparc SPARC_Lelli2016c.mrt --rotdir ./rotcurves/
+
+Author: Aurélien Sureau (2026)
+DOI:    10.5281/zenodo.19609775
 """
 
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.optimize import differential_evolution, brentq
-from scipy.integrate import trapezoid
-import os, warnings
+from scipy.optimize import differential_evolution, minimize_scalar
+from scipy.stats import linregress, pearsonr
+import argparse, os, warnings
 warnings.filterwarnings('ignore')
 
-# ── Constantes ─────────────────────────────────────────────────────────────
-G        = 6.674e-11    # m³ kg⁻¹ s⁻²
-G_gal    = 4.302e-3     # (km/s)² pc / M_sol  (unités galactiques)
-c        = 2.998e8      # m/s
-kpc_m    = 3.086e19     # 1 kpc en mètres
-M_sol    = 1.989e30     # kg
-km_s     = 1e3          # m/s
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 1 — PHYSICS
+# ══════════════════════════════════════════════════════════════════════
 
-# ── Chemins des données ─────────────────────────────────────────────────────
-ROTDIR = './sparc_data/rotcurves/'
-SPARCF = './sparc_data/SPARC_Lelli2016c.mrt'
+def V_EOS(r, Vbar, V0r, rc):
+    """
+    Le Flux EOS MIT Bag formula (Sureau 2026, Eq. 1).
+    Derived from Euler equilibrium + MIT Bag equation of state P = rho/3 - B.
 
+    V²_total(r) = V²_bar(r) + V0² * r² / (rc² + r²)
+    V0 = V0r * max(V_bar)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# I. LECTURE DES DONNÉES SPARC
-# ══════════════════════════════════════════════════════════════════════════════
-
-def read_sparc_table():
-    """Lit la table principale SPARC (Lelli et al. 2016).
-    Retourne un dict {nom_galaxie: {T: type_Hubble, Q: qualité}}"""
-    gals = {}
-    with open(SPARCF) as f:
-        for line in f:
-            vals = line.split()
-            if len(vals) < 18:
-                continue
-            try:
-                gals[vals[0]] = {
-                    'T': int(vals[1]),
-                    'Q': int(vals[17])
-                }
-            except (ValueError, IndexError):
-                continue
-    return gals
+    Parameters
+    ----------
+    r    : array, galactocentric radius [kpc]
+    Vbar : array, baryonic velocity [km/s]
+    V0r  : float, dimensionless vortex amplitude (free parameter)
+    rc   : float, vortex coherence length [kpc] (free or bounded)
+    """
+    V0 = V0r * np.max(Vbar)
+    return np.sqrt(np.maximum(Vbar**2 + V0**2 * r**2 / (rc**2 + r**2), 0))
 
 
-def read_rotcurve(name):
-    """Lit une courbe de rotation individuelle.
-    Colonnes : r(kpc), Vobs(km/s), errV(km/s), Vgas, Vdisk, Vbul
-    Retourne dict ou None si fichier absent."""
-    fname = os.path.join(ROTDIR, f"{name}_rotmod.dat")
+def chi2r(Vm, Vo, eV):
+    """Reduced chi-squared."""
+    return np.sum(((Vm - Vo) / eV)**2) / max(len(Vo) - 1, 1)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 2 — DATA I/O
+# ══════════════════════════════════════════════════════════════════════
+
+def read_rotcurve(name, rotdir='.', Ydisk=0.5):
+    """
+    Read {name}_rotmod.dat from SPARC.
+    Ydisk=0.5 follows Schombert+2014 recommendation for Spitzer 3.6um.
+
+    Returns dict with r, Vobs, errV, Vbar or None if file not found.
+    """
+    fname = os.path.join(rotdir, f'{name}_rotmod.dat')
     if not os.path.exists(fname):
         return None
     data = []
@@ -79,7 +85,7 @@ def read_rotcurve(name):
                 v = [float(x) for x in line.split()]
                 if len(v) >= 6:
                     data.append(v[:6])
-            except ValueError:
+            except:
                 continue
     if not data:
         return None
@@ -90,384 +96,457 @@ def read_rotcurve(name):
         return None
     r, Vobs, errV = d[:, 0], d[:, 1], d[:, 2]
     Vgas, Vdisk, Vbul = d[:, 3], d[:, 4], d[:, 5]
-    # V²_bar = V²_gas + 0.5*(V²_disk + V²_bul)
-    V2b = np.abs(Vgas)*Vgas + 0.5*(np.abs(Vdisk)*Vdisk + np.abs(Vbul)*Vbul)
-    Vbar = np.sqrt(np.maximum(V2b, 0))
-    return {'r': r, 'Vobs': Vobs, 'errV': errV, 'Vbar': Vbar}
+    # Baryonic velocity with Ydisk scaling
+    V2b = np.abs(Vgas)*Vgas + Ydisk*(np.abs(Vdisk)*Vdisk + np.abs(Vbul)*Vbul)
+    return {
+        'r': r, 'Vobs': Vobs, 'errV': errV,
+        'Vbar': np.sqrt(np.maximum(V2b, 0))
+    }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# II. FORMULE EOS β — FLUX PRIMORDIAL
-# ══════════════════════════════════════════════════════════════════════════════
-
-def V_EOS_beta(r, Vbar, V0_rel, rc):
-    """Formule EOS MIT β — dérivée depuis l'équilibre d'Euler + EOS MIT Bag.
-
-    V²_total(r) = V²_bar(r) + V₀² × r² / (rc² + r²)
-    avec V₀ = V₀_rel × max(V_bar)  [couplage causal]
-
-    Args:
-        r      : array, rayons en kpc
-        Vbar   : array, vitesse baryonique en km/s
-        V0_rel : float, amplitude relative du vortex (paramètre libre)
-        rc     : float, rayon de cœur en kpc (paramètre libre)
-    Returns:
-        V_total : array en km/s
+def parse_sparc(filepath):
     """
-    V0 = V0_rel * np.max(Vbar)
-    return np.sqrt(np.maximum(
-        Vbar**2 + V0**2 * r**2 / (rc**2 + r**2), 0))
+    Parse SPARC_Lelli2016c.mrt.
+    Returns dict: name -> {T, L36, SBdisk, SBeff, Rdisk, RHI, Vflat}
+    """
+    galaxies = {}
+    with open(filepath) as f:
+        lines = f.readlines()
+    for line in lines[98:]:
+        if not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) < 18:
+            continue
+        try:
+            name    = parts[0]
+            T       = int(parts[1])
+            L36     = float(parts[7])
+            SBeff   = float(parts[8])  if float(parts[8])  > 0 else np.nan
+            Rdisk   = float(parts[11]) if float(parts[11]) > 0 else np.nan
+            SBdisk  = float(parts[12]) if float(parts[12]) > 0 else np.nan
+            RHI     = float(parts[14]) if float(parts[14]) > 0 else np.nan
+            Vflat   = float(parts[15])
+            Q       = int(parts[17])
+            if Q in [1, 2] and Vflat > 5 and L36 > 0:
+                galaxies[name] = {
+                    'T': T, 'L36': L36, 'SBeff': SBeff,
+                    'Rdisk': Rdisk, 'SBdisk': SBdisk,
+                    'RHI': RHI, 'Vflat': Vflat
+                }
+        except:
+            continue
+    print(f"SPARC parsed: {len(galaxies)} galaxies (Q=1,2)")
+    return galaxies
 
 
-def V_EOS_beta_GR(r, Vbar, V0_rel, rc):
-    """EOS β avec correction GR de Schwarzschild.
-    La correction est de l'ordre de 10⁻⁵ aux échelles galactiques —
-    indétectable, cadre newtonien rigoureusement justifié."""
-    V_Newton = V_EOS_beta(r, Vbar, V0_rel, rc)
-    M_tot = (V_Newton * km_s)**2 * r * kpc_m / G
-    r_s   = 2 * G * M_tot / c**2
-    factor = 1.0 / np.sqrt(np.maximum(1 - r_s / (r * kpc_m), 0.99))
-    return V_Newton * factor
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 3 — FITTING
+# ══════════════════════════════════════════════════════════════════════
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# III. MODÈLES DE RÉFÉRENCE : NFW ET BURKERT
-# ══════════════════════════════════════════════════════════════════════════════
-
-def V_NFW(r, Vbar, rho0_norm, rs):
-    """Profil NFW : ρ(r) = ρ₀ / [(r/rs)(1 + r/rs)²]"""
-    x = r / rs
-    M_NFW = 4 * np.pi * rho0_norm * rs**3 * (np.log(1 + x) - x / (1 + x))
-    M_bar = np.maximum(Vbar**2, 0) * r / G_gal
-    V2 = G_gal * (M_bar + np.maximum(M_NFW, 0)) / r
-    return np.sqrt(np.maximum(V2, 0))
-
-
-def V_Burkert(r, Vbar, rho0_norm, rc):
-    """Profil Burkert : ρ(r) = ρ₀ / [(1 + r/rc)(1 + (r/rc)²)]"""
-    x = r / rc
-    M_Bur = np.pi * rho0_norm * rc**3 * (
-        np.log(1 + x**2) + 2*np.log(1 + x) - 2*np.arctan(x))
-    M_bar = np.maximum(Vbar**2, 0) * r / G_gal
-    V2 = G_gal * (M_bar + np.maximum(M_Bur, 0)) / r
-    return np.sqrt(np.maximum(V2, 0))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# IV. CLASSIFICATION MORPHOLOGIQUE ET FIT
-# ══════════════════════════════════════════════════════════════════════════════
-
-def classify(T):
-    """Classification depuis type Hubble T — AVANT tout calcul numérique.
-    T = 0-7  → spirale  → vortex EOS β
-    T = 8-9  → transition → mixte
-    T = 10+  → naine → dérive"""
-    if T <= 7:
-        return 'eos_beta'
-    elif T <= 9:
-        return 'mixte'
-    else:
-        return 'derive'
-
-
-def chi2r(Vmodel, Vobs, errV):
-    """χ² réduit."""
-    return np.sum(((Vmodel - Vobs) / errV)**2) / max(len(Vobs) - 1, 1)
-
-
-def fit_flux(gd, T, bounds_V0=(0.1, 4.0)):
-    """Optimise V₀_rel et rc par differential evolution.
-    Retourne (V0_rel_opt, rc_opt, chi2r_opt)"""
+def fit_free(gd):
+    """
+    Model A: Free fit — both V0r and rc optimized per galaxy.
+    Returns (V0r, rc, chi2r).
+    """
     r, Vobs, errV, Vbar = gd['r'], gd['Vobs'], gd['errV'], gd['Vbar']
-    r_max = r[-1]
+
+    def cost(p):
+        return chi2r(V_EOS(r, Vbar, abs(p[0]), abs(p[1])), Vobs, errV)
+
+    res = differential_evolution(
+        cost, bounds=[(0.1, 4.0), (0.1, r[-1] * 1.5)],
+        seed=42, maxiter=500, popsize=10, tol=1e-7
+    )
+    return abs(res.x[0]), abs(res.x[1]), res.fun
+
+
+def fit_bounded(gd, RHI, C_low=5.0, C_high=5.0):
+    """
+    Model D: Physics-guided bounds on rc.
+
+    rc constrained to [RHI/C_low, C_high*RHI].
+
+    Physical justification:
+      - Lower bound (RHI/C_low): vortex coherence length cannot be much
+        smaller than the gaseous disk — insufficient baryonic material
+        to organize Flux motion below this scale.
+      - Upper bound (C_high*RHI): beyond C_high*RHI, baryonic gravitational
+        potential weakens and cannot confine coherent vortex motion.
+
+    Only V0r is truly free. rc explores the physically allowed range.
+    Returns (V0r, rc, chi2r, within_bounds).
+    """
+    r, Vobs, errV, Vbar = gd['r'], gd['Vobs'], gd['errV'], gd['Vbar']
+    rc_min = max(RHI / C_low, 0.1)
+    rc_max = C_high * RHI
+    if rc_min >= rc_max:
+        rc_min, rc_max = 0.1, r[-1] * 5
 
     def cost(p):
         V0r, rc = abs(p[0]), abs(p[1])
-        meca = classify(T)
-        if meca == 'eos_beta':
-            Vt = V_EOS_beta(r, Vbar, V0r, rc)
-        elif meca == 'mixte':
-            Vt = V_EOS_beta(r, Vbar, V0r * 0.7, rc)
-        else:
-            # Naine : vortex faible + baryons
-            V0 = V0r * np.max(Vbar) * 0.3
-            Vt = np.sqrt(np.maximum(Vbar**2 + V0**2 * r**2 / (rc**2 + r**2), 0))
-        return chi2r(Vt, Vobs, errV)
+        penalty = 0.0
+        if rc < rc_min:
+            penalty = 50.0 * ((rc_min - rc) / rc_min)**2
+        elif rc > rc_max:
+            penalty = 50.0 * ((rc - rc_max) / rc_max)**2
+        return chi2r(V_EOS(r, Vbar, V0r, rc), Vobs, errV) + penalty
 
     res = differential_evolution(
-        cost,
-        bounds=[bounds_V0, (0.1, r_max * 1.5)],
-        seed=42, maxiter=500, tol=1e-5, popsize=10
+        cost, bounds=[(0.1, 4.0), (rc_min * 0.8, rc_max * 1.2)],
+        seed=42, maxiter=500, popsize=15, tol=1e-7
     )
-    V0r_opt, rc_opt = abs(res.x[0]), abs(res.x[1])
-    return V0r_opt, rc_opt, res.fun
+    V0r = abs(res.x[0])
+    rc  = abs(res.x[1])
+    within = rc_min <= rc <= rc_max
+    return V0r, rc, res.fun, within
 
 
-def fit_NFW(gd):
-    """Fit NFW avec même procédure."""
-    r, Vobs, errV, Vbar = gd['r'], gd['Vobs'], gd['errV'], gd['Vbar']
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 4 — CORRELATION ANALYSIS
+# ══════════════════════════════════════════════════════════════════════
 
-    def cost(p):
-        return chi2r(V_NFW(r, Vbar, abs(p[0]), abs(p[1])), Vobs, errV)
-
-    res = differential_evolution(cost, [(1e2, 1e8), (0.1, r[-1]*2)],
-                                  seed=42, maxiter=500, popsize=10)
-    return abs(res.x[0]), abs(res.x[1]), res.fun
-
-
-def fit_Burkert(gd):
-    """Fit Burkert avec même procédure."""
-    r, Vobs, errV, Vbar = gd['r'], gd['Vobs'], gd['errV'], gd['Vbar']
-
-    def cost(p):
-        return chi2r(V_Burkert(r, Vbar, abs(p[0]), abs(p[1])), Vobs, errV)
-
-    res = differential_evolution(cost, [(1e2, 1e8), (0.1, r[-1]*2)],
-                                  seed=42, maxiter=500, popsize=10)
-    return abs(res.x[0]), abs(res.x[1]), res.fun
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# V. TEST PRINCIPAL — 163 GALAXIES SPARC
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run_sparc_test(max_galaxies=None, quality_filter=[1, 2]):
-    """Test principal sur le catalogue SPARC complet.
-
-    Args:
-        max_galaxies   : int ou None, pour tester sur un sous-ensemble
-        quality_filter : liste des qualités à inclure (1=haute, 2=moyenne)
-
-    Returns:
-        results : liste de dicts avec les résultats par galaxie
+def partial_correlation(x, y, z):
     """
-    gals = read_sparc_table()
-    print(f"Galaxies dans SPARC : {len(gals)}")
+    Partial correlation of x and y controlling for z.
+    Computed via residual regression.
+    Returns (r_partial, p_value, R2_partial).
+    """
+    # Residuals of x ~ z
+    slope_xz, int_xz, *_ = linregress(z, x)
+    res_x = x - (int_xz + slope_xz * z)
+    # Residuals of y ~ z
+    slope_yz, int_yz, *_ = linregress(z, y)
+    res_y = y - (int_yz + slope_yz * z)
+    # Correlation of residuals
+    r, p = pearsonr(res_x, res_y)
+    return r, p, r**2
 
+
+def partial_correlation_2(x, y, z1, z2):
+    """Partial correlation of x and y controlling for z1 AND z2."""
+    from numpy.linalg import lstsq
+    Z = np.column_stack([np.ones(len(z1)), z1, z2])
+    res_x = x - Z @ lstsq(Z, x, rcond=None)[0]
+    res_y = y - Z @ lstsq(Z, y, rcond=None)[0]
+    r, p = pearsonr(res_x, res_y)
+    return r, p, r**2
+
+
+def run_correlation_analysis(results):
+    """
+    Test correlations of log(rc) vs log(SBdisk), log(SBeff),
+    log(Rdisk), log(RHI), controlling for log(L36) and log(Vflat).
+    """
+    log_rc   = np.array([np.log10(r['rc'])     for r in results])
+    log_L36  = np.array([np.log10(r['L36'])    for r in results])
+    log_Vf   = np.array([np.log10(r['Vflat'])  for r in results])
+
+    observables = {}
+    for key in ['SBdisk', 'SBeff', 'Rdisk', 'RHI']:
+        vals = np.array([r[key] for r in results])
+        mask = np.isfinite(vals) & (vals > 0)
+        observables[key] = (np.log10(vals[mask]), log_rc[mask],
+                            log_L36[mask], log_Vf[mask], np.sum(mask))
+
+    print(f"\n{'='*72}")
+    print(f"CORRELATION ANALYSIS: log(rc) vs baryonic observables")
+    print(f"{'='*72}")
+    print(f"{'Observable':<12} {'N':>4} {'γ':>7} {'±err':>7} {'R²':>7} {'p':>10}  {'Partial R²':>10} {'p_partial':>10}")
+    print("-"*72)
+
+    corr_results = {}
+    for key, (log_obs, log_rc_m, log_L_m, log_Vf_m, N) in observables.items():
+        # Raw correlation
+        slope, intercept, r, p, se = linregress(log_obs, log_rc_m)
+        # Partial correlation (control L36)
+        r_p, p_p, R2_p = partial_correlation(log_obs, log_rc_m, log_L_m)
+        print(f"{key:<12} {N:>4} {slope:>7.3f} {se:>7.3f} {r**2:>7.3f} {p:>10.2e}  {R2_p:>10.3f} {p_p:>10.2e}")
+        corr_results[key] = {
+            'gamma': slope, 'se': se, 'R2': r**2, 'p': p,
+            'R2_partial': R2_p, 'p_partial': p_p, 'N': N
+        }
+
+    # Double control: RHI | L36 + Vflat
+    log_obs, log_rc_m, log_L_m, log_Vf_m, N = observables['RHI']
+    # Align Vflat
+    r_pp, p_pp, R2_pp = partial_correlation_2(log_obs, log_rc_m, log_L_m, log_Vf_m)
+    print(f"\nRHI | L[3.6]+Vflat  N={N}  R²={R2_pp:.3f}  p={p_pp:.2e}  (double control)")
+
+    return corr_results
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 5 — GRID SEARCH
+# ══════════════════════════════════════════════════════════════════════
+
+def run_grid_search(good_results, rotdir,
+                    C_low_grid=[3., 5., 7., 10.],
+                    C_high_grid=[2., 3., 4., 5., 6., 8.]):
+    """
+    Grid search for optimal physical bounds (C_low, C_high).
+    Returns best (C_low, C_high) and corresponding median chi2r.
+    """
+    print(f"\n{'='*72}")
+    print(f"GRID SEARCH: optimal physical bounds on rc")
+    print(f"Testing {len(C_low_grid)} x {len(C_high_grid)} = {len(C_low_grid)*len(C_high_grid)} combinations")
+    print(f"{'='*72}")
+    print(f"{'C_low':>6} {'C_high':>7} {'N':>4} {'median χ²r':>11} {'%within':>8}")
+    print("-"*40)
+
+    best_med = 1e10
+    best_combo = None
+    best_fits = None
+
+    for C_low in C_low_grid:
+        for C_high in C_high_grid:
+            fits = []
+            for r in good_results:
+                gd = read_rotcurve(r['name'], rotdir=rotdir)
+                if gd is None or np.isnan(r['RHI']):
+                    continue
+                try:
+                    V0r, rc, c2r, within = fit_bounded(gd, r['RHI'], C_low, C_high)
+                    fits.append({'chi2r': c2r, 'within': within})
+                except:
+                    continue
+            if len(fits) < 10:
+                continue
+            med = np.median([f['chi2r'] for f in fits])
+            pct = 100 * np.mean([f['within'] for f in fits])
+            print(f"{C_low:>6.1f} {C_high:>7.1f} {len(fits):>4} {med:>11.3f} {pct:>7.1f}%")
+            if med < best_med:
+                best_med = med
+                best_combo = (C_low, C_high)
+                best_fits = fits
+
+    print(f"\n★ Best: C_low={best_combo[0]}, C_high={best_combo[1]}, median χ²r={best_med:.3f}")
+    print(f"  vs NFW=1.47 | Burkert=0.79 | MOND~1.20 | Le Flux free=0.535")
+    return best_combo, best_med, best_fits
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 6 — FIGURES
+# ══════════════════════════════════════════════════════════════════════
+
+def plot_partial_correlations(results, outdir='.'):
+    """Figure 1: 2x2 partial correlation panels (RHI and SBdisk)."""
+    log_rc   = np.array([np.log10(r['rc'])    for r in results])
+    log_L36  = np.array([np.log10(r['L36'])   for r in results])
+    colors   = np.array([r['T']               for r in results])
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.patch.set_facecolor('#0d1117')
+
+    panels = [
+        ('RHI',    'log RHI (kpc)',  True,  False),
+        ('RHI',    'partial log RHI | L[3.6]', True, True),
+        ('SBdisk', 'log Σ₀ (L☉/pc²)', False, False),
+        ('SBdisk', 'partial log Σ₀ | L[3.6]', False, True),
+    ]
+
+    for ax, (key, xlabel, is_rhi, is_partial) in zip(axes.flat, panels):
+        ax.set_facecolor('#161b22')
+        ax.tick_params(colors='white', labelsize=9)
+        ax.xaxis.label.set_color('white')
+        ax.yaxis.label.set_color('white')
+        ax.title.set_color('white')
+        for sp in ax.spines.values():
+            sp.set_edgecolor('#30363d')
+        ax.grid(True, alpha=0.1, color='white')
+
+        vals = np.array([r[key] for r in results])
+        mask = np.isfinite(vals) & (vals > 0)
+        lv = np.log10(vals[mask])
+        lr = log_rc[mask]
+        ll = log_L36[mask]
+        col = colors[mask]
+
+        if is_partial:
+            slope_vl, int_vl, *_ = linregress(ll, lv)
+            lv = lv - (int_vl + slope_vl * ll)
+            slope_rl, int_rl, *_ = linregress(ll, lr)
+            lr = lr - (int_rl + slope_rl * ll)
+
+        sc = ax.scatter(lv, lr, c=col, cmap='plasma', s=20, alpha=0.7)
+        slope, intercept, r_val, p_val, se = linregress(lv, lr)
+        xfit = np.linspace(lv.min(), lv.max(), 100)
+        ax.plot(xfit, intercept + slope * xfit,
+                color='#3fb950' if is_rhi else '#ef5350', lw=2)
+
+        label = f'γ={slope:.2f}±{se:.2f}\nR²={r_val**2:.3f}  p={p_val:.2e}\nN={mask.sum()}'
+        ax.text(0.97, 0.05, label, transform=ax.transAxes,
+                fontsize=8, color='white', ha='right', va='bottom',
+                bbox=dict(boxstyle='round', facecolor='#0d1117', alpha=0.7))
+        ax.set_xlabel(xlabel, fontsize=9)
+        ax.set_ylabel('log rc (kpc)' if not is_partial else 'residual log rc', fontsize=9)
+        title = ('RHI' if is_rhi else 'Σ₀') + (' (partial)' if is_partial else ' (raw)')
+        ax.set_title(title, fontsize=10, color='white')
+
+    fig.suptitle('LE FLUX Addendum 1 — Partial correlations rc vs RHI and Σ₀\n'
+                 'Color = Hubble type T | Sureau 2026',
+                 color='white', fontsize=12)
+    plt.tight_layout()
+    outpath = os.path.join(outdir, 'flux_partial_corr.png')
+    plt.savefig(outpath, dpi=150, bbox_inches='tight', facecolor='#0d1117')
+    plt.close()
+    print(f"Saved: {outpath}")
+
+
+def plot_chi2r_comparison(c2_free, c2_bounded, best_combo, outdir='.'):
+    """Figure 2: chi2r distribution comparison."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig.patch.set_facecolor('#0d1117')
+
+    for ax in axes:
+        ax.set_facecolor('#161b22')
+        ax.tick_params(colors='white', labelsize=10)
+        ax.xaxis.label.set_color('white')
+        ax.yaxis.label.set_color('white')
+        ax.title.set_color('white')
+        for sp in ax.spines.values():
+            sp.set_edgecolor('#30363d')
+        ax.grid(True, alpha=0.1, color='white')
+
+    bins = np.linspace(0, 8, 40)
+
+    # Left: distributions
+    ax = axes[0]
+    ax.hist(np.clip(c2_free, 0, 8), bins=bins, alpha=0.85, color='#3fb950',
+            label=f'Free fit (2 params)  med={np.median(c2_free):.2f}')
+    ax.hist(np.clip(c2_bounded, 0, 8), bins=bins, alpha=0.65, color='#42a5f5',
+            label=f'Bounded (1 param)    med={np.median(c2_bounded):.2f}')
+    ax.axvline(1.47, color='#ef5350', lw=2, linestyle=':', alpha=0.8, label='NFW 1.47')
+    ax.axvline(0.79, color='#ffa726', lw=2, linestyle=':', alpha=0.8, label='Burkert 0.79')
+    ax.axvline(np.median(c2_free),    color='#3fb950', lw=2, linestyle='--')
+    ax.axvline(np.median(c2_bounded), color='#42a5f5', lw=2, linestyle='--')
+    ax.set_xlabel('Reduced χ²r', fontsize=11)
+    ax.set_ylabel('Number of galaxies', fontsize=11)
+    ax.legend(fontsize=9, framealpha=0.3, facecolor='#161b22', labelcolor='white')
+    ax.set_title('χ²r distributions — SPARC galaxies', fontsize=11, color='white')
+
+    # Right: bar chart
+    ax = axes[1]
+    labels = ['NFW\n(2-3 params\n+ free Ydisk)',
+              'MOND\n(1 param\nYdisk=0.5)',
+              'Burkert\n(2 params\n+ free Ydisk)',
+              f'Le Flux\nbounded\n(1 param)',
+              'Le Flux\nfree fit\n(2 params)']
+    vals = [1.47, 1.20, 0.79, np.median(c2_bounded), np.median(c2_free)]
+    cols = ['#ef5350', '#ab47bc', '#ffa726', '#42a5f5', '#3fb950']
+    bars = ax.barh(labels, vals, color=cols, alpha=0.88, height=0.55)
+    ax.axvline(1.0, color='white', lw=1.5, linestyle=':', alpha=0.5)
+    for bar, val in zip(bars, vals):
+        ax.text(val + 0.02, bar.get_y() + bar.get_height()/2,
+                f'{val:.3f}', va='center', ha='left',
+                color='white', fontsize=10, fontweight='bold')
+    ax.set_xlabel('Median χ²r (lower = better)', fontsize=11)
+    ax.set_title(f'C_low={best_combo[0]}, C_high={best_combo[1]}\n'
+                 f'† free Ydisk not granted to Le Flux', fontsize=10, color='white')
+
+    fig.suptitle('LE FLUX v10 Addendum 1 — Model comparison on SPARC galaxies\n'
+                 'Le Flux: Ydisk=0.5 fixed (Schombert+2014)  '
+                 '| NFW & Burkert: free Ydisk (Li+2020)\n'
+                 'Sureau 2026 | DOI: 10.5281/zenodo.19609775',
+                 color='white', fontsize=11)
+    plt.tight_layout()
+    outpath = os.path.join(outdir, 'flux_chi2r_addendum1.png')
+    plt.savefig(outpath, dpi=150, bbox_inches='tight', facecolor='#0d1117')
+    plt.close()
+    print(f"Saved: {outpath}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 7 — MAIN
+# ══════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(description='Le Flux Addendum 1 analysis')
+    parser.add_argument('--sparc',  default='SPARC_Lelli2016c.mrt',
+                        help='Path to SPARC MRT file')
+    parser.add_argument('--rotdir', default='.',
+                        help='Directory containing *_rotmod.dat files')
+    parser.add_argument('--outdir', default='.',
+                        help='Output directory for figures')
+    parser.add_argument('--skip-grid', action='store_true',
+                        help='Skip grid search (use C_low=5, C_high=5)')
+    args = parser.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    # ── Parse SPARC ──
+    sparc = parse_sparc(args.sparc)
+
+    # ── Fit free (Model A) ──
+    print(f"\n{'='*72}")
+    print(f"STEP 1: Free fit (Model A) — V0r and rc both free")
+    print(f"{'='*72}")
     results = []
-    n_done  = 0
-
-    for name, meta in gals.items():
-        if meta['Q'] not in quality_filter:
-            continue
-        if max_galaxies and n_done >= max_galaxies:
-            break
-
-        gd = read_rotcurve(name)
+    names = list(sparc.keys())
+    for i, name in enumerate(names):
+        gd = read_rotcurve(name, rotdir=args.rotdir)
         if gd is None:
             continue
-
-        T = meta['T']
         try:
-            V0r, rc, c2r_flux    = fit_flux(gd, T)
-            _, _, c2r_nfw        = fit_NFW(gd)
-            _, _, c2r_bur        = fit_Burkert(gd)
-
+            V0r, rc, c2r = fit_free(gd)
+            meta = sparc[name]
             results.append({
-                'name'     : name,
-                'T'        : T,
-                'Q'        : meta['Q'],
-                'V0r'      : V0r,
-                'rc'       : rc,
-                'Vbar_max' : np.max(gd['Vbar']),
-                'c2r_flux' : c2r_flux,
-                'c2r_nfw'  : c2r_nfw,
-                'c2r_bur'  : c2r_bur,
-                'meca'     : classify(T),
+                'name': name, 'V0r': V0r, 'rc': rc, 'chi2r_A': c2r,
+                'T': meta['T'], 'L36': meta['L36'],
+                'SBdisk': meta['SBdisk'], 'SBeff': meta['SBeff'],
+                'Rdisk': meta['Rdisk'], 'RHI': meta['RHI'],
+                'Vflat': meta['Vflat'], 'gd': gd
             })
-            n_done += 1
-
-            if n_done % 10 == 0:
-                c2rs = [r['c2r_flux'] for r in results]
-                print(f"  {n_done:4d} galaxies — χ²r médian Flux = {np.median(c2rs):.3f}")
-
-        except Exception as e:
-            print(f"  {name} : {e}")
+        except:
             continue
+        if (i + 1) % 25 == 0:
+            print(f"  {i+1}/{len(names)}...")
 
-    return results
+    good = [r for r in results if r['chi2r_A'] < 5]
+    c2_free = np.array([r['chi2r_A'] for r in good])
+    print(f"Quality cut χ²r<5: {len(good)} galaxies")
+    print(f"Median χ²r (free): {np.median(c2_free):.3f}")
 
+    # ── Correlation analysis ──
+    print(f"\nSTEP 2: Correlation analysis")
+    good_rhi = [r for r in good if np.isfinite(r['RHI'])]
+    corr = run_correlation_analysis(good_rhi)
 
-def print_statistics(results):
-    """Affiche les statistiques finales."""
-    c2r_flux = np.array([r['c2r_flux'] for r in results])
-    c2r_nfw  = np.array([r['c2r_nfw']  for r in results])
-    c2r_bur  = np.array([r['c2r_bur']  for r in results])
+    # ── Grid search ──
+    print(f"\nSTEP 3: Physics-guided bounds")
+    if args.skip_grid:
+        best_combo = (5.0, 5.0)
+        print(f"Skipping grid search, using C_low=5, C_high=5")
+        fits_bounded = []
+        for r in good_rhi:
+            try:
+                V0r, rc, c2r, within = fit_bounded(r['gd'], r['RHI'], 5.0, 5.0)
+                fits_bounded.append({'chi2r': c2r, 'within': within})
+            except:
+                continue
+        best_med = np.median([f['chi2r'] for f in fits_bounded])
+    else:
+        best_combo, best_med, fits_bounded = run_grid_search(
+            good_rhi, args.rotdir
+        )
 
-    print("\n" + "="*55)
-    print(f"RÉSULTATS SUR {len(results)} GALAXIES SPARC")
-    print("="*55)
-    print(f"{'Modèle':>12} {'χ²r médian':>12} {'Victoires':>10}")
-    print("-"*36)
+    c2_bounded = np.array([f['chi2r'] for f in fits_bounded])
+    print(f"\n{'='*72}")
+    print(f"FINAL RESULTS")
+    print(f"{'='*72}")
+    print(f"Model A (free, 2 params)       : median χ²r = {np.median(c2_free):.3f}")
+    print(f"Model D (bounded, 1 param)     : median χ²r = {best_med:.3f}")
+    print(f"NFW reference (Li+2020)        : median χ²r = 1.47")
+    print(f"Burkert reference (Li+2020)    : median χ²r = 0.79")
+    print(f"MOND reference                 : median χ²r ~ 1.20")
+    print(f"Note: NFW and Burkert use free Ydisk (extra parameter not granted to Le Flux)")
 
-    flux_wins = np.sum(c2r_flux < np.minimum(c2r_nfw, c2r_bur))
-    nfw_wins  = np.sum(c2r_nfw  < np.minimum(c2r_flux, c2r_bur))
-    bur_wins  = np.sum(c2r_bur  < np.minimum(c2r_flux, c2r_nfw))
+    # ── Figures ──
+    print(f"\nSTEP 4: Generating figures")
+    plot_partial_correlations(good_rhi, outdir=args.outdir)
+    plot_chi2r_comparison(c2_free, c2_bounded, best_combo, outdir=args.outdir)
+    print(f"\nDone. All outputs in: {args.outdir}")
 
-    print(f"{'Flux EOS β':>12} {np.median(c2r_flux):>12.3f} "
-          f"{flux_wins:>5}/{len(results)}")
-    print(f"{'Burkert':>12} {np.median(c2r_bur):>12.3f} "
-          f"{bur_wins:>5}/{len(results)}")
-    print(f"{'NFW':>12} {np.median(c2r_nfw):>12.3f} "
-          f"{nfw_wins:>5}/{len(results)}")
-
-    V0r_vals = np.array([r['V0r'] for r in results if r['meca']=='eos_beta'])
-    rc_vals  = np.array([r['rc']  for r in results if r['meca']=='eos_beta'])
-    print(f"\nV₀_rel médian (spirales) = {np.median(V0r_vals):.3f} "
-          f"(IQR {np.percentile(V0r_vals,25):.2f}–{np.percentile(V0r_vals,75):.2f})")
-    print(f"rc médian (spirales)     = {np.median(rc_vals):.2f} kpc")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VI. AMAS DE GALAXIES — ÉQUATION DE JEANS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def rho_flux_cluster(r_kpc, C, rc_kpc):
-    """Profil de densité du Flux dans un amas.
-    ρ_Flux(r) = C / (r² + rc²)
-    Dérivé depuis l'équilibre Euler + EOS MIT Bag + terme d'expansion."""
-    r_m  = r_kpc  * kpc_m
-    rc_m = rc_kpc * kpc_m
-    return C / (r_m**2 + rc_m**2)
-
-
-def M_flux_cluster(r_kpc, C, rc_kpc, n=300):
-    """Masse cumulée du Flux dans un amas à rayon r_kpc."""
-    r_arr = np.logspace(np.log10(0.1), np.log10(r_kpc), n)
-    rho   = rho_flux_cluster(r_arr, C, rc_kpc)
-    return trapezoid(4 * np.pi * (r_arr * kpc_m)**2 * rho, r_arr * kpc_m)
-
-
-def sigma_jeans(r_eval_kpc, M_bar_fn, rho_bar_fn, C, rc_kpc, r_max_kpc=4000):
-    """Dispersion de vitesse σ(r) via l'équation de Jeans.
-
-    σ²(r) = (1/ρ_bar) × ∫_r^∞ ρ_bar × G × M_total/r'² dr'
-
-    avec M_total = M_bar + M_Flux
-    """
-    r_arr = np.logspace(np.log10(r_eval_kpc), np.log10(r_max_kpc), 400)
-    r_m   = r_arr * kpc_m
-    rho_b = np.array([rho_bar_fn(r) for r in r_arr])
-    M_b   = np.array([M_bar_fn(r)   for r in r_arr])
-    M_f   = np.array([M_flux_cluster(r, C, rc_kpc) for r in r_arr])
-
-    integrand = rho_b * G * (M_b + M_f) / r_m**2
-    integral  = trapezoid(integrand, r_m)
-    rho0      = rho_bar_fn(r_eval_kpc)
-    if rho0 <= 0:
-        return 0.0
-    return np.sqrt(max(integral / rho0, 0)) / km_s
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VII. SYSTÈME SOLAIRE — TEST DE COHÉRENCE
-# ══════════════════════════════════════════════════════════════════════════════
-
-def solar_system_test(V0_rel=1.2, rc_kpc=5.0):
-    """Vérifie que le vortex de Flux est invisible dans le système solaire.
-
-    Le trou noir galactique central est à ~8 kpc.
-    Les planètes sont à 0.4–30 AU = 2×10⁻⁵ à 1.5×10⁻⁴ kpc.
-    → On est très loin du rayon de cœur rc → vortex ≈ 0.
-    """
-    AU_kpc = 4.848e-9  # 1 AU en kpc
-
-    # Vitesses orbitales kepléiennes (km/s)
-    planets = {
-        'Mercure': (0.387, 47.4),
-        'Vénus'  : (0.723, 35.0),
-        'Terre'  : (1.000, 29.8),
-        'Mars'   : (1.524, 24.1),
-        'Jupiter': (5.203, 13.1),
-        'Saturne': (9.537,  9.7),
-        'Uranus' : (19.19,  6.8),
-        'Neptune': (30.07,  5.4),
-    }
-
-    print("\nTEST SYSTÈME SOLAIRE")
-    print("="*60)
-    print(f"V₀_rel={V0_rel}, rc={rc_kpc} kpc")
-    print(f"{'Planète':>10} {'r (AU)':>8} {'V_Kep':>8} "
-          f"{'V_vortex':>12} {'ratio':>10}")
-    print("-"*60)
-
-    for name, (r_AU, V_kep) in planets.items():
-        r_kpc = r_AU * AU_kpc
-        V_sun = V_kep  # vitesse baryonique ≈ keplérienne
-        V_tot = V_EOS_beta(
-            np.array([r_kpc]),
-            np.array([V_sun]),
-            V0_rel, rc_kpc
-        )[0]
-        V_vortex = V_tot - V_sun
-        ratio    = V_vortex / V_kep
-
-        print(f"{name:>10} {r_AU:>8.3f} {V_kep:>8.1f} "
-              f"{V_vortex:>12.6f} {ratio:>10.2e}")
-
-    print(f"\n→ Contribution du vortex < 10⁻⁶ × V_Kepler ✓")
-    print(f"  Cadre newtonien rigoureusement justifié")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VIII. TEST GR — CORRECTION SCHWARZSCHILD SUR EOS β
-# ══════════════════════════════════════════════════════════════════════════════
-
-def gr_test(name='NGC3198'):
-    """Applique la correction GR de Schwarzschild sur EOS β.
-    Montre que Δχ²r < 10⁻⁵ — correction indétectable."""
-    gd = read_rotcurve(name)
-    if gd is None:
-        print(f"Données non trouvées pour {name}")
-        return
-
-    gals  = read_sparc_table()
-    T     = gals.get(name, {}).get('T', 5)
-    V0r, rc, c2r_newton = fit_flux(gd, T)
-
-    r, Vobs, errV, Vbar = gd['r'], gd['Vobs'], gd['errV'], gd['Vbar']
-    V_newton = V_EOS_beta(r, Vbar, V0r, rc)
-    V_gr     = V_EOS_beta_GR(r, Vbar, V0r, rc)
-
-    c2r_gr = chi2r(V_gr, Vobs, errV)
-    dV_max = np.max(np.abs(V_gr - V_newton))
-
-    print(f"\nTEST GR — {name}")
-    print(f"  χ²r Newton  = {c2r_newton:.6f}")
-    print(f"  χ²r GR      = {c2r_gr:.6f}")
-    print(f"  Δ(χ²r)      = {c2r_gr - c2r_newton:.2e}")
-    print(f"  ΔV max      = {dV_max:.4f} km/s")
-    print(f"  → Correction GR indétectable ✓")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# IX. POINT D'ENTRÉE PRINCIPAL
-# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
-    import sys
-
-    print("LE FLUX — Test quantitatif complet")
-    print("Aurélien Sureau, Mars 2026")
-    print("DOI : 10.5281/zenodo.19219721")
-    print("="*55)
-
-    # Test système solaire
-    solar_system_test()
-
-    # Test GR
-    gr_test('NGC3198')
-
-    # Test SPARC complet
-    # Pour un test rapide, mettre max_galaxies=20
-    # Pour le test complet : max_galaxies=None
-    print("\n\nTEST SPARC COMPLET")
-    print("(peut prendre 30-60 min selon la machine)")
-    print("Pour un test rapide : modifier max_galaxies=20")
-
-    results = run_sparc_test(max_galaxies=None, quality_filter=[1, 2])
-
-    if results:
-        print_statistics(results)
-
-    print("\nDone.")
+    main()
