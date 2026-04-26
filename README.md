@@ -65,7 +65,7 @@ Reproduces: median χ²r = 0.136, 13/13 clusters with χ²r < 3.
 DOI: https://doi.org/10.5281/zenodo.19785792
 
 **Addendum 2** (galaxy clusters, X-COP):
-Included as `LeFlux_v10_Addendum2.docx` — to be submitted to Zenodo v4.
+added.
 
 ---
 
