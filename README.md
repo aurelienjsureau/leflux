@@ -62,7 +62,7 @@ Reproduces: median χ²r = 0.136, 13/13 clusters with χ²r < 3.
 ## Preprints
 
 **Le Flux v10** (main paper + Addendum 1: r_c ∝ R_HI):
-DOI: [10.5281/zenodo.19610251](https://doi.org/10.5281/zenodo.19610251)
+DOI: https://doi.org/10.5281/zenodo.19785792
 
 **Addendum 2** (galaxy clusters, X-COP):
 Included as `LeFlux_v10_Addendum2.docx` — to be submitted to Zenodo v4.
@@ -79,4 +79,4 @@ Included as `LeFlux_v10_Addendum2.docx` — to be submitted to Zenodo v4.
 
 ## Author
 
-Aurélien Sureau — April 2026 — Independent research.
+Aurélien Sureau — April 2026.
