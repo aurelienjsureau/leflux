@@ -68,7 +68,7 @@ SPARC rotation curve fitting.
 python3 flux_complet.py
 ```
 
-### `leflux_xcop_addendum2.py`
+### `flux_xcop.py`
 X-COP galaxy cluster fitting — Addendum 2.
 ```bash
 python3 leflux_xcop_addendum2.py
