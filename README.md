@@ -75,7 +75,7 @@ python3 leflux_xcop_addendum2.py
 ```
 Reproduces: median χ²r = 0.136, 13/13 clusters with χ²r < 3.
 
-### `leflux_cmb_addendum3.py`
+### `flux_cmb.py`
 CMB TT power spectrum — Addendum 3.
 ```bash
 pip install camb
