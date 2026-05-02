@@ -101,7 +101,7 @@ Reproduces: median χ²r = 0.136, 13/13 clusters with χ²r < 3.
 CMB TT power spectrum — Addendum 3.
 ```bash
 pip install camb
-python3 leflux_cmb_addendum3.py
+python3 leflux_cmb.py
 ```
 Reproduces: χ²r = 1.330 on Planck 2018 TT.
 
@@ -120,7 +120,7 @@ DOI: [10.5281/zenodo.19219720](https://doi.org/10.5281/zenodo.19219720) *(all ve
 
 These are active areas of investigation, not flaws in the model:
 
-- **Production mechanism**: How does the QGP substrate achieve the correct cold relic abundance from the QCD crossover? Non-thermal mechanisms are being explored.
+- **Production mechanism**: How does the QGP substrate achieve the correct cold relic abundance from the QCD crossover? The sexaquark hypothesis (Farrar 2017, 2024) provides a candidate for the cold confined state — Non-thermal mechanisms are being explored.
 - **Vortex propagation**: Seeding from BH spin to kpc scales — GRMHD simulation required to confirm the mechanism.
 - **CMB predictive power**: Deriving H₀ and Ω_c from QCD fundamentals remains the next theoretical milestone.
 - **γ measurement**: Direct Bayesian fit of γ on SPARC rotation curves to constrain the EOS exponent observationally — identified as the next decisive test.
