@@ -111,7 +111,7 @@ Reproduces: χ²r = 1.330 on Planck 2018 TT.
 
 ## Preprints
 
-**Le Flux v11** (main paper + Addenda 1–5):  
+**Le Flux** (main paper + Addenda 1–5):  
 DOI: [10.5281/zenodo.19219720](https://doi.org/10.5281/zenodo.19219720) *(all versions)*
 
 ---
